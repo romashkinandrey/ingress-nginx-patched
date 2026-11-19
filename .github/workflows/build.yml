@@ -114,3 +114,5 @@ jobs:
           echo "### ${{ steps.v.outputs.ver }}" >> $GITHUB_STEP_SUMMARY
           echo "- контроллер: \`${{ steps.ctl.outputs.img }}@${{ steps.ctl.outputs.digest }}\`" >> $GITHUB_STEP_SUMMARY
           echo "- базовый: \`${{ steps.base.outputs.img }}@${{ steps.base.outputs.digest }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "#### Патчи CVE в nginx базового образа" >> $GITHUB_STEP_SUMMARY
+          ls src/images/nginx/rootfs/patches | grep -o -E 'CVE-[0-9]+-[0-9]+' | sort -u | sed 's/^/- /' >> $GITHUB_STEP_SUMMARY

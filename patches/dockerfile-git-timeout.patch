@@ -1,0 +1,13 @@
+diff --git a/images/nginx/rootfs/Dockerfile b/images/nginx/rootfs/Dockerfile
+index f064880d1..ac5d3309c 100644
+--- a/images/nginx/rootfs/Dockerfile
++++ b/images/nginx/rootfs/Dockerfile
+@@ -12,6 +12,8 @@
+ # See the License for the specific language governing permissions and
+ # limitations under the License.
+ FROM alpine:3.23.3@sha256:25109184c71bdad752c8312a8623239686a9a2071e8825f20acb8f2198c3f659 AS builder
++# Локально для пробной сборки: git падает при застое загрузки, а не висит вечно
++ENV GIT_HTTP_LOW_SPEED_LIMIT=1000 GIT_HTTP_LOW_SPEED_TIME=60
+ 
+ COPY . /
+ 

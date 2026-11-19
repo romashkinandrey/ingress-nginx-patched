@@ -1,0 +1,116 @@
+# Сборка ingress-nginx из форка Chainguard (chainguard-forks/ingress-nginx) и публикация в GHCR.
+# Базовый образ собирается из images/nginx форка (в NGINX_BASE форка — старый образ без патчей CVE),
+# контроллер — на этом базовом. Новые теги controller-v* форка проверяются по расписанию.
+name: build-ingress-nginx
+on:
+  schedule:
+    - cron: "17 3 * * *"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Тег форка (controller-v1.15.N); пусто — последний"
+        required: false
+permissions:
+  contents: read
+concurrency: { group: build-ingress-nginx, cancel-in-progress: false }
+jobs:
+  plan:
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.p.outputs.tag }}
+      build: ${{ steps.p.outputs.build }}
+    steps:
+      - id: p
+        env:
+          GH_TOKEN: ${{ github.token }}
+          OWNER: ${{ github.repository_owner }}
+        run: |
+          set -euo pipefail
+          tag="${{ inputs.tag }}"
+          if [ -z "$tag" ]; then
+            tag=$(gh api 'repos/chainguard-forks/ingress-nginx/releases?per_page=30' --jq '[.[] | select(.tag_name|startswith("controller-v"))][0].tag_name')
+          fi
+          [ -n "$tag" ] || { echo "тег форка не найден"; exit 1; }
+          ver=${tag#controller-}
+          owner=$(echo "$OWNER" | tr A-Z a-z)
+          if docker manifest inspect "ghcr.io/$owner/ingress-nginx-controller:$ver" >/dev/null 2>&1 && [ "${{ github.event_name }}" = schedule ]; then
+            echo "build=false" >> "$GITHUB_OUTPUT"; echo "образ $ver уже опубликован"
+          else
+            echo "build=true" >> "$GITHUB_OUTPUT"
+          fi
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+  build:
+    needs: plan
+    if: needs.plan.outputs.build == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+      attestations: write
+    env:
+      TAG: ${{ needs.plan.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v4
+        with: { path: wf }
+      - uses: actions/checkout@v4
+        with:
+          repository: chainguard-forks/ingress-nginx
+          ref: ${{ needs.plan.outputs.tag }}
+          path: src
+      - name: Подготовка
+        id: v
+        run: |
+          set -euo pipefail
+          owner=$(echo "${{ github.repository_owner }}" | tr A-Z a-z)
+          echo "owner=$owner" >> "$GITHUB_OUTPUT"
+          echo "ver=${TAG#controller-}" >> "$GITHUB_OUTPUT"
+          echo "base=$(cat src/images/nginx/TAG)" >> "$GITHUB_OUTPUT"
+          git -C src apply ../wf/patches/dockerfile-git-timeout.patch
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Базовый образ (nginx 1.27.1 + патчи CVE форка), до 3 попыток
+        id: base
+        run: |
+          set -uo pipefail
+          IMG=ghcr.io/${{ steps.v.outputs.owner }}/ingress-nginx-nginx:${{ steps.v.outputs.base }}-${{ steps.v.outputs.ver }}
+          for a in 1 2 3; do
+            docker buildx build src/images/nginx/rootfs --platform linux/amd64 --push \
+              --label org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }} \
+              --provenance=mode=max --sbom=true -t "$IMG" && break
+            [ $a = 3 ] && exit 1; echo "повтор $a"
+          done
+          echo "img=$IMG" >> "$GITHUB_OUTPUT"
+          echo "digest=$(docker buildx imagetools inspect "$IMG" --format '{{json .Manifest.Digest}}' | tr -d '"')" >> "$GITHUB_OUTPUT"
+      - name: Контроллер
+        id: ctl
+        run: |
+          set -euo pipefail
+          cd src
+          mkdir -p /tmp/fakehome
+          HOME=/tmp/fakehome DOCKER_CONFIG=$HOME/.docker make BASE_IMAGE=${{ steps.base.outputs.img }} ARCH=amd64 \
+            REGISTRY=local/ingress-nginx TAG=${{ steps.v.outputs.ver }} build image
+          IMG=ghcr.io/${{ steps.v.outputs.owner }}/ingress-nginx-controller:${{ steps.v.outputs.ver }}
+          printf 'FROM local/ingress-nginx/controller:%s\n' "${{ steps.v.outputs.ver }}" | \
+            docker build --label org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }} \
+              --label org.opencontainers.image.version=${{ steps.v.outputs.ver }} -t "$IMG" -
+          docker run --rm --entrypoint /nginx-ingress-controller "$IMG" --version
+          test "$(docker run --rm --entrypoint sh "$IMG" -c 'grep -a -c max_headers $(command -v nginx)')" -ge 1
+          docker push "$IMG"
+          echo "img=$IMG" >> "$GITHUB_OUTPUT"
+          echo "digest=$(docker inspect --format '{{index .RepoDigests 0}}' "$IMG" | cut -d@ -f2)" >> "$GITHUB_OUTPUT"
+      - uses: actions/attest-build-provenance@v2
+        with:
+          subject-name: ghcr.io/${{ steps.v.outputs.owner }}/ingress-nginx-controller
+          subject-digest: ${{ steps.ctl.outputs.digest }}
+          push-to-registry: true
+      - name: Итог
+        run: |
+          echo "### ${{ steps.v.outputs.ver }}" >> $GITHUB_STEP_SUMMARY
+          echo "- контроллер: \`${{ steps.ctl.outputs.img }}@${{ steps.ctl.outputs.digest }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "- базовый: \`${{ steps.base.outputs.img }}@${{ steps.base.outputs.digest }}\`" >> $GITHUB_STEP_SUMMARY

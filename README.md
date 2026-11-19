@@ -56,7 +56,39 @@
 
 Для каждой новой сборки список CVE-патчей выводится в итог запуска GitHub Actions.
 
-## Использование с чартом ingress-nginx 4.15.x
+## Опубликованные образы
+
+| Версия | Образ | Digest |
+|---|---|---|
+| v1.15.16 | `ghcr.io/romashkinandrey/ingress-nginx-controller:v1.15.16` | `sha256:8cd9bae7f5c0788a7103a591662cdfe0b6f91cac4ad106ae0bd532ff75e3fddc` |
+| v1.15.16 (базовый) | `ghcr.io/romashkinandrey/ingress-nginx-nginx:v2.2.26-v1.15.16` | `sha256:5c80ee37732ce16c8b3c52c3e2a1c2055dbe1e260b75894c68a84e68e18d9081` |
+
+Только `linux/amd64`. Ставить по digest, а не по тегу: тег можно перезаписать, digest — нет.
+Базовый образ нужен только для сборки, в кластер ставится образ контроллера.
+
+## Как поставить
+
+Чарт — штатный `ingress-nginx` 4.15.x из `https://kubernetes.github.io/ingress-nginx`, меняется только образ контроллера.
+
+### 1. Проверить образ перед выкладкой
+
+```bash
+# digest тега совпадает с таблицей выше
+crane digest ghcr.io/romashkinandrey/ingress-nginx-controller:v1.15.16
+# sha256:8cd9bae7f5c0788a7103a591662cdfe0b6f91cac4ad106ae0bd532ff75e3fddc
+
+# образ собран workflow этого репозитория (подпись GitHub)
+gh attestation verify \
+  oci://ghcr.io/romashkinandrey/ingress-nginx-controller@sha256:8cd9bae7f5c0788a7103a591662cdfe0b6f91cac4ad106ae0bd532ff75e3fddc \
+  --owner romashkinandrey
+
+# версия и признак исправлений внутри
+docker run --rm --entrypoint /nginx-ingress-controller \
+  ghcr.io/romashkinandrey/ingress-nginx-controller@sha256:8cd9bae7f5c0788a7103a591662cdfe0b6f91cac4ad106ae0bd532ff75e3fddc --version
+# Release: v1.15.16, nginx version: nginx/1.27.1
+```
+
+### 2. Values для helm
 
 ```yaml
 controller:
@@ -64,14 +96,49 @@ controller:
     registry: ghcr.io
     image: romashkinandrey/ingress-nginx-controller
     tag: v1.15.16
-    digest: "sha256:..."   # брать из итога сборки или `docker buildx imagetools inspect`
-    digestChroot: ""
+    digest: "sha256:8cd9bae7f5c0788a7103a591662cdfe0b6f91cac4ad106ae0bd532ff75e3fddc"
+    digestChroot: ""        # chroot-вариант не собирается; оставить пустым
 ```
 
-## Проверка происхождения
+`digest` задавать обязательно: иначе чарт подставит свой digest апстримного образа, и pull не пройдёт.
+Остальные values не меняются; образ webhook (`kube-webhook-certgen`) остаётся штатным.
 
 ```bash
-gh attestation verify oci://ghcr.io/romashkinandrey/ingress-nginx-controller:v1.15.16 --owner romashkinandrey
+helm upgrade ingress-nginx ingress-nginx/ingress-nginx --version 4.15.1 -n ingress-nginx \
+  --reuse-values -f image-values.yaml --wait --timeout 25m
 ```
 
-Сборка повторяет рецепт CI форка; функциональная проверка образа — на стороне того, кто его использует.
+То же в helmfile — второй файл values в релизе:
+
+```yaml
+releases:
+  - name: ingress-nginx
+    chart: ingress-nginx/ingress-nginx
+    version: 4.15.1
+    values:
+      - values/default.yaml
+      - values/image-patched.yaml   # блок controller.image выше
+```
+
+### 3. На что смотреть при выкладке
+
+- Контроллер в виде DaemonSet меняется по одному узлу; при долгих WebSocket старый под ждёт закрытия соединений
+  (`worker-shutdown-timeout` 240 с), поэтому на узел уходит 4–5 минут. Таймаут helm 10 минут для 5 узлов мал — ставить 25 минут.
+- После замены: `kubectl -n <ns> get pods -o jsonpath='{..image}'` — везде `@sha256:8cd9bae7…`;
+  в логах контроллера нет `[emerg]`; `nginx_ingress_controller_config_last_reload_successful` = 1.
+
+### 4. Откат
+
+```bash
+helm rollback ingress-nginx <предыдущая ревизия> -n ingress-nginx --wait --timeout 25m
+```
+
+или вернуть штатный образ апстрима: `registry.k8s.io/ingress-nginx/controller:v1.15.1@sha256:594ceea76b01c592858f803f9ff4d2cb40542cae2060410b2c95f75907d659e1`
+(в values — `registry: registry.k8s.io`, `image: ingress-nginx/controller`, `tag: v1.15.1`, этот digest).
+
+## Новые версии
+
+Workflow каждый день проверяет теги `controller-v*` форка и собирает только новые. Digest и список CVE-патчей
+каждой сборки — в итоге запуска на вкладке Actions; таблица «Опубликованные образы» выше обновляется вручную.
+
+Сборка повторяет рецепт CI форка; функциональная проверка образа на своей конфигурации — на стороне того, кто его использует.
